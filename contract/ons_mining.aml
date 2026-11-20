@@ -1,0 +1,833 @@
+Program ons_mining {
+
+  // SPDX-License-Identifier: MIT
+  //
+  // Fraction mining for ONS. The admin lists a reserved name of 3, 4 or 5 characters; its
+  // fractions are mined one at a time, each an XNS-1 token. In a window of epochs every hash below
+  // the floor is a share worth one point, and when the window has passed the lowest share wins the
+  // fraction. Whoever holds the full set combines it (or buys the last tenth out); the set is burned
+  // and the name is recorded for ONS to issue.
+  //
+  // The network's Program admission refuses a loop in a function of two or more arguments, and a
+  // loop anywhere once the constructor takes two or more: loops sit only in one-argument helpers.
+
+  event Minted(token_id: u128, owner: address, creator: address)
+  event Transferred(token_id: u128, from: address, to: address)
+  event Burned(token_id: u128, owner: address, total_supply: u128)
+  event Approved(token_id: u128, approved: address)
+  event ApprovalRevoked(token_id: u128)
+  event OperatorSet(owner: address, operator: address, approved: u128)
+
+  event Listed(name: string, fractions: u128, window: u128)
+  event Unlisted(name: string)
+  event Share(name: string, index: u128, miner: address, value: u128)
+  event Won(name: string, index: u128, token_id: u128, miner: address)
+  event WindowEmpty(name: string, index: u128)
+  event Combined(name: string, owner: address)
+  event BoughtOut(name: string, owner: address, paid: u128)
+  event Withdrawn(to: address, amount: u128)
+
+  const HEX:     string = "0123456789abcdef"
+  const DIGITS:  string = "0123456789"
+  const LOWER:   string = "abcdefghijklmnopqrstuvwxyz"
+  const MAX:     u128 = 340282366920938463463374607431768211455
+  const MAX_FLOOR: u128 = 170141183460469231731687303715884105727
+  const SHARES_AIM: u128 = 64
+  const BPS: u128 = 10000
+  const INTERFACE_VERSION: u128 = 1
+  // a buyout price set by the admin takes effect this many epochs later (about 3 days)
+  const PRICE_DELAY: u128 = 21600
+
+  state {
+    admin: address
+    pending_admin: address
+    nobody: address
+    // writes the OCT/USD rate, as for ONS
+    feeder: address
+    paused: u128
+
+    base_window: u128
+    start_floor: u128
+
+    // USD cents per year, as in ONS, and micro-OCT per USD
+    price_3: u128
+    price_4: u128
+    price_5: u128
+    rate: u128
+    rate_epoch: u128
+    stale_epochs: u128
+    buyout_multiple: u128
+    buyout_bps: u128
+
+    // listed names, in order
+    name_count: u128
+    name_at_i: map[u128]string
+    listed: map[string]u128
+
+    // per name
+    count: map[string]u128
+    mult: map[string]u128
+    window_len: map[string]u128
+    index: map[string]u128
+    seed: map[string]string
+    floor: map[string]u128
+    window_end: map[string]u128
+    best: map[string]u128
+    best_miner: map[string]address
+    best_digest: map[string]string
+    shares: map[string]u128
+    // 1 once every fraction is mined, 2 once the set is combined
+    stage: map[string]u128
+    price_override: map[string]u128
+    override_from: map[string]u128
+
+    // a hash already counted, so it cannot be sent twice
+    used: map[string]u128
+
+    // points: shares found, in total and per name ("name|address")
+    points: map[address]u128
+    name_points: map[string]u128
+
+    // fraction tokens
+    next_id: u128
+    burned_count: u128
+    base_uri: string
+    token_owner: map[u128]address
+    token_name: map[u128]string
+    token_index: map[u128]u128
+    // token id + 1 for "name|index"
+    token_of: map[string]u128
+    balances: map[address]u128
+    owned_at: map[address]map[u128]u128
+    owned_index: map[u128]u128
+    approvals: map[u128]address
+    operator_approvals: map[address]map[address]u128
+    // fractions of one name a wallet holds, "name|address"
+    held: map[string]u128
+
+    // bought-out holders' payments, waiting to be withdrawn
+    owed: map[address]u128
+
+    // combined sets, oldest first, for ONS to issue
+    combined_count: u128
+    combined_name: map[u128]string
+    combined_to: map[u128]address
+    combined_epoch: map[u128]u128
+  }
+
+  // No arguments: the deployer is admin and feeder until set_role moves them.
+  constructor() {
+    self.admin = caller
+    self.feeder = caller
+    self.base_window = 300
+    // about one hash in a million is a share
+    self.start_floor = 324518553658426726783156020576256
+    self.price_3 = 64000
+    self.price_4 = 16000
+    self.price_5 = 500
+    self.stale_epochs = 10000
+    self.buyout_multiple = 3
+    self.buyout_bps = 9000
+    self.base_uri = ""
+  }
+
+  // ---- internal ----
+
+  private fn only_admin() {
+    require(caller == self.admin, "mine: not admin")
+  }
+
+  private fn _sum(a: u128, b: u128): u128 {
+    let c: u128 = a + b
+    require(c >= a, "mine: overflow")
+    return c
+  }
+
+  private fn _mul(a: u128, b: u128): u128 {
+    if a == 0 { return 0 }
+    let c: u128 = a * b
+    require(c / a == b, "mine: overflow")
+    return c
+  }
+
+  private fn _key(name: string, addr: address): string {
+    return concat(concat(name, "|"), to_string(addr))
+  }
+
+  private fn _slot(name: string, i: u128): string {
+    return concat(concat(name, "|"), to_string(i))
+  }
+
+  // 1 when every character is a-z or 0-9
+  private fn _plain(name: string): u128 {
+    let n: u128 = len(name)
+    for i in 0..5 {
+      if i < n {
+        let c: string = substr(name, i, 1)
+        if index_of(LOWER, c) < 0 && index_of(DIGITS, c) < 0 { return 0 }
+      }
+    }
+    return 1
+  }
+
+  // 1 when every character is the same
+  private fn _same(name: string): u128 {
+    let n: u128 = len(name)
+    let first: string = substr(name, 0, 1)
+    for i in 1..5 {
+      if i < n {
+        if substr(name, i, 1) != first { return 0 }
+      }
+    }
+    return 1
+  }
+
+  // 1 when the name reads the same backwards
+  private fn _mirror(name: string): u128 {
+    let n: u128 = len(name)
+    for i in 0..2 {
+      if i < n / 2 {
+        if substr(name, i, 1) != substr(name, n - 1 - i, 1) { return 0 }
+      }
+    }
+    return 1
+  }
+
+  // 1 when each character is one step after the previous, or one step before, in 0-9 or a-z
+  private fn _run(name: string): u128 {
+    let n: u128 = len(name)
+    let set: string = DIGITS
+    if index_of(DIGITS, substr(name, 0, 1)) < 0 { set = LOWER }
+    let up: u128 = 1
+    let down: u128 = 1
+    for i in 1..5 {
+      if i < n {
+        let a: int = index_of(set, substr(name, i - 1, 1))
+        let b: int = index_of(set, substr(name, i, 1))
+        if a < 0 || b < 0 { return 0 }
+        if b != a + 1 { up = 0 }
+        if b + 1 != a { down = 0 }
+      }
+    }
+    if up == 1 || down == 1 { return 1 }
+    return 0
+  }
+
+  // 4 for one repeated character, 2 for a run or mirror, 1 otherwise
+  private fn _multiplier(name: string): u128 {
+    if _same(name) == 1 { return 4 }
+    if _run(name) == 1 || _mirror(name) == 1 { return 2 }
+    return 1
+  }
+
+  // 1 when the text is exactly 32 lowercase hex characters
+  private fn _hex32(nonce: string): u128 {
+    if len(nonce) != 32 { return 0 }
+    for i in 0..32 {
+      if index_of(HEX, substr(nonce, i, 1)) < 0 { return 0 }
+    }
+    return 1
+  }
+
+  // the first 32 hex characters of a digest, read as a number
+  private fn _top(digest: string): u128 {
+    let v: u128 = 0
+    for i in 0..32 {
+      let d: int = index_of(HEX, substr(digest, i, 1))
+      require(d >= 0, "mine: digest is not hex")
+      let u: u128 = d
+      v = v * 16 + u
+    }
+    return v
+  }
+
+  private fn _challenge(name: string): string {
+    let s: string = concat("ons-mine-v1|", name)
+    s = concat(s, "|")
+    s = concat(s, to_string(self.index[name]))
+    s = concat(s, "|")
+    s = concat(s, self.seed[name])
+    return concat(s, "|")
+  }
+
+  // the next floor: aims for SHARES_AIM shares a window and moves at most fourfold
+  private fn _retarget(f: u128, s: u128): u128 {
+    let up: u128 = MAX_FLOOR
+    if f <= MAX_FLOOR / 4 { up = f * 4 }
+    if s == 0 { return up }
+    let down: u128 = f / 4
+    if down == 0 { down = 1 }
+    let per: u128 = f / s
+    let next: u128 = MAX_FLOOR
+    if per <= MAX_FLOOR / SHARES_AIM { next = per * SHARES_AIM }
+    if next > up { next = up }
+    if next < down { next = down }
+    return next
+  }
+
+  private fn _open_window(name: string) {
+    self.window_end[name] = _sum(epoch, self.window_len[name])
+    self.best[name] = MAX
+    self.best_miner[name] = self.nobody
+    self.best_digest[name] = ""
+    self.shares[name] = 0
+  }
+
+  private fn _hold(addr: address, id: u128) {
+    let i: u128 = self.balances[addr]
+    self.owned_at[addr][i] = id
+    self.owned_index[id] = i
+    self.balances[addr] = _sum(i, 1)
+    let k: string = _key(self.token_name[id], addr)
+    self.held[k] = _sum(self.held[k], 1)
+  }
+
+  private fn _drop(addr: address, id: u128) {
+    require(self.balances[addr] >= 1, "mine: zero balance")
+    let last: u128 = self.balances[addr] - 1
+    let i: u128 = self.owned_index[id]
+    if i != last {
+      let moved: u128 = self.owned_at[addr][last]
+      self.owned_at[addr][i] = moved
+      self.owned_index[moved] = i
+    }
+    self.owned_at[addr][last] = 0
+    self.owned_index[id] = 0
+    self.balances[addr] = last
+    let k: string = _key(self.token_name[id], addr)
+    self.held[k] = self.held[k] - 1
+  }
+
+  private fn _mint(name: string, i: u128, to: address): u128 {
+    let id: u128 = self.next_id
+    self.next_id = _sum(id, 1)
+    self.token_owner[id] = to
+    self.token_name[id] = name
+    self.token_index[id] = i
+    self.token_of[_slot(name, i)] = _sum(id, 1)
+    _hold(to, id)
+    emit Minted(id, to, self.admin)
+    emit Transferred(id, self.nobody, to)
+    return id
+  }
+
+  private fn _burn(id: u128) {
+    let owner: address = self.token_owner[id]
+    _drop(owner, id)
+    self.token_owner[id] = self.nobody
+    self.approvals[id] = self.nobody
+    self.burned_count = _sum(self.burned_count, 1)
+    emit Transferred(id, owner, self.nobody)
+    emit Burned(id, owner, self.next_id - self.burned_count)
+  }
+
+  private fn _require_live(id: u128) {
+    require(id < self.next_id, "mine: no such token")
+    require(self.token_owner[id] != self.nobody, "mine: token burned")
+  }
+
+  private fn _move(id: u128, from: address, to: address) {
+    _drop(from, id)
+    self.token_owner[id] = to
+    _hold(to, id)
+    self.approvals[id] = self.nobody
+    emit Transferred(id, from, to)
+  }
+
+  private fn _record_combined(name: string, owner: address) {
+    self.stage[name] = 2
+    self.combined_name[self.combined_count] = name
+    self.combined_to[self.combined_count] = owner
+    self.combined_epoch[self.combined_count] = epoch
+    self.combined_count = _sum(self.combined_count, 1)
+  }
+
+  // burns every fraction of a name; the caller's checks come first
+  private fn _burn_all(name: string) {
+    let k: u128 = self.count[name]
+    for i in 0..32 {
+      if i < k {
+        let v: u128 = self.token_of[_slot(name, i)]
+        _burn(v - 1)
+      }
+    }
+  }
+
+  // credits every holder but the caller for their fractions, then burns the set
+  private fn _pay_out(name: string) {
+    let k: u128 = self.count[name]
+    let each: u128 = _buyout_price(name)
+    for i in 0..32 {
+      if i < k {
+        let id: u128 = self.token_of[_slot(name, i)] - 1
+        let owner: address = self.token_owner[id]
+        if owner != caller { self.owed[owner] = _sum(self.owed[owner], each) }
+        _burn(id)
+      }
+    }
+  }
+
+  // price of one fraction in micro-OCT: the yearly price x the multiple x the multiplier / count,
+  // or a price the admin set for this name once its delay has passed
+  private fn _buyout_price(name: string): u128 {
+    if self.override_from[name] > 0 && epoch >= self.override_from[name] { return self.price_override[name] }
+    require(self.rate > 0, "mine: no rate yet")
+    require(epoch - self.rate_epoch <= self.stale_epochs, "mine: rate is stale")
+    let n: u128 = len(name)
+    let cents: u128 = self.price_5
+    if n == 3 { cents = self.price_3 }
+    if n == 4 { cents = self.price_4 }
+    let yearly: u128 = _mul(cents, self.rate) / 100
+    return _mul(_mul(yearly, self.buyout_multiple), self.mult[name]) / self.count[name]
+  }
+
+  private fn _needed(name: string): u128 {
+    return _mul(self.count[name], self.buyout_bps) / BPS
+  }
+
+  // ---- mining ----
+
+  // Sends one hash. It counts as a share when its value is below the floor; the lowest share of the
+  // window wins the fraction. The nonce is 32 lowercase hex characters.
+  fn mine(name: string, nonce: string): u128 {
+    require(self.paused == 0, "mine: paused")
+    require(self.listed[name] == 1, "mine: not listed")
+    require(self.stage[name] == 0, "mine: every fraction is mined")
+    require(_hex32(nonce) == 1, "mine: nonce must be 32 lowercase hex characters")
+    let digest: string = to_string(sha256(concat(concat(concat(_challenge(name), to_string(caller)), "|"), nonce)))
+    require(self.used[digest] == 0, "mine: already sent")
+    let v: u128 = _top(digest)
+    require(v < self.floor[name], "mine: not below the floor")
+
+    self.used[digest] = 1
+    self.shares[name] = _sum(self.shares[name], 1)
+    self.points[caller] = _sum(self.points[caller], 1)
+    let k: string = _key(name, caller)
+    self.name_points[k] = _sum(self.name_points[k], 1)
+    if v < self.best[name] {
+      self.best[name] = v
+      self.best_miner[name] = caller
+      self.best_digest[name] = digest
+    }
+    emit Share(name, self.index[name], caller, v)
+    return v
+  }
+
+  // Closes a window whose last epoch has passed. Anyone may call it.
+  fn settle(name: string): u128 {
+    require(self.paused == 0, "mine: paused")
+    require(self.listed[name] == 1, "mine: not listed")
+    require(self.stage[name] == 0, "mine: every fraction is mined")
+    require(epoch >= self.window_end[name], "mine: window still open")
+
+    let i: u128 = self.index[name]
+    let s: u128 = self.shares[name]
+    if s > 0 {
+      let winner: address = self.best_miner[name]
+      let id: u128 = _mint(name, i, winner)
+      emit Won(name, i, id, winner)
+      self.index[name] = _sum(i, 1)
+    } else {
+      emit WindowEmpty(name, i)
+    }
+    self.floor[name] = _retarget(self.floor[name], s)
+    let next_seed: string = concat(concat(self.seed[name], "|"), self.best_digest[name])
+    self.seed[name] = to_string(sha256(concat(concat(next_seed, "|"), to_string(epoch))))
+    if self.index[name] >= self.count[name] {
+      self.stage[name] = 1
+    } else {
+      _open_window(name)
+    }
+    return self.index[name]
+  }
+
+  // ---- full sets ----
+
+  // Burns a full set held by the caller and records the name for ONS to issue to them.
+  fn combine(name: string): bool {
+    require(self.paused == 0, "mine: paused")
+    require(self.stage[name] == 1, "mine: not every fraction is mined")
+    require(self.held[_key(name, caller)] == self.count[name], "mine: you do not hold every fraction")
+    _burn_all(name)
+    _record_combined(name, caller)
+    emit Combined(name, caller)
+    return true
+  }
+
+  // A holder of at least 90% of the fractions (rounded down) pays for the rest. The other holders
+  // are credited and withdraw; the set is burned and the name recorded for the caller.
+  payable fn buyout(name: string): u128 {
+    require(self.paused == 0, "mine: paused")
+    require(self.stage[name] == 1, "mine: not every fraction is mined")
+    let mine_count: u128 = self.held[_key(name, caller)]
+    require(mine_count >= _needed(name), "mine: you hold too few fractions")
+    let missing: u128 = self.count[name] - mine_count
+    let total: u128 = _mul(_buyout_price(name), missing)
+    require(value >= total, "mine: not enough sent")
+    _pay_out(name)
+    if value > total {
+      let back: bool = transfer(caller, value - total)
+      require(back, "mine: refund failed")
+    }
+    _record_combined(name, caller)
+    emit BoughtOut(name, caller, total)
+    emit Combined(name, caller)
+    return total
+  }
+
+  fn withdraw(): u128 {
+    let amount: u128 = self.owed[caller]
+    require(amount > 0, "mine: nothing to withdraw")
+    self.owed[caller] = 0
+    let ok: bool = transfer(caller, amount)
+    require(ok, "mine: transfer failed")
+    emit Withdrawn(caller, amount)
+    return amount
+  }
+
+  // ---- XNS-1 ----
+
+  fn transfer(to: address, token_id: u128): bool {
+    _require_live(token_id)
+    assert_address(to)
+    require(self.token_owner[token_id] == caller, "mine: not owner")
+    require(to != caller, "mine: already owner")
+    _move(token_id, caller, to)
+    return true
+  }
+
+  fn transfer_from(from: address, to: address, token_id: u128): bool {
+    _require_live(token_id)
+    assert_address(from)
+    assert_address(to)
+    let current_owner: address = self.token_owner[token_id]
+    require(from == current_owner, "mine: from is not owner")
+    require(to != current_owner, "mine: already owner")
+    let approved: address = self.approvals[token_id]
+    let is_operator: u128 = self.operator_approvals[from][caller]
+    require(caller == current_owner || caller == approved || is_operator == 1, "mine: not authorized")
+    _move(token_id, from, to)
+    return true
+  }
+
+  fn approve(approved: address, token_id: u128): bool {
+    _require_live(token_id)
+    assert_address(approved)
+    let current_owner: address = self.token_owner[token_id]
+    let is_operator: u128 = self.operator_approvals[current_owner][caller]
+    require(caller == current_owner || is_operator == 1, "mine: not authorized")
+    self.approvals[token_id] = approved
+    emit Approved(token_id, approved)
+    return true
+  }
+
+  fn revoke_approval(token_id: u128): bool {
+    _require_live(token_id)
+    let current_owner: address = self.token_owner[token_id]
+    let is_operator: u128 = self.operator_approvals[current_owner][caller]
+    require(caller == current_owner || is_operator == 1, "mine: not authorized")
+    self.approvals[token_id] = self.nobody
+    emit ApprovalRevoked(token_id)
+    return true
+  }
+
+  fn set_operator(operator: address, approved: u128): bool {
+    assert_address(operator)
+    require(operator != caller, "mine: cannot self-operate")
+    require(approved <= 1, "mine: approved must be 0 or 1")
+    self.operator_approvals[caller][operator] = approved
+    emit OperatorSet(caller, operator, approved)
+    return true
+  }
+
+  view fn owner_of(token_id: u128): address {
+    _require_live(token_id)
+    return self.token_owner[token_id]
+  }
+
+  view fn balance_of(addr: address): u128 {
+    assert_address(addr)
+    return self.balances[addr]
+  }
+
+  view fn token_uri(token_id: u128): string {
+    _require_live(token_id)
+    return concat(concat(self.base_uri, to_string(token_id)), ".json")
+  }
+
+  view fn creator_of(token_id: u128): address {
+    _require_live(token_id)
+    return self.admin
+  }
+
+  view fn royalty_of(token_id: u128): u128 {
+    _require_live(token_id)
+    return 0
+  }
+
+  view fn get_approved(token_id: u128): address {
+    _require_live(token_id)
+    return self.approvals[token_id]
+  }
+
+  view fn is_approved_or_owner(token_id: u128, addr: address): u128 {
+    assert_address(addr)
+    _require_live(token_id)
+    let current_owner: address = self.token_owner[token_id]
+    if addr == current_owner { return 1 }
+    if self.approvals[token_id] == addr { return 1 }
+    if self.operator_approvals[current_owner][addr] == 1 { return 1 }
+    return 0
+  }
+
+  view fn total_supply(): u128 {
+    return self.next_id - self.burned_count
+  }
+
+  view fn get_contract_info(): string {
+    let s: string = concat("ONS Mining|ONSF|", to_string(self.next_id - self.burned_count))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.admin))
+    s = concat(s, "|")
+    return concat(s, to_string(INTERFACE_VERSION))
+  }
+
+  // ---- views ----
+
+  // the text a miner hashes, followed by its own address, "|" and a nonce
+  view fn challenge(name: string): string {
+    require(self.listed[name] == 1, "mine: not listed")
+    return _challenge(name)
+  }
+
+  // index|count|multiplier|floor|best|best_miner|shares|window_end|window_len|stage
+  view fn window(name: string): string {
+    if self.listed[name] != 1 { return "" }
+    let who: string = ""
+    if self.best[name] < MAX { who = to_string(self.best_miner[name]) }
+    let s: string = concat(to_string(self.index[name]), "|")
+    s = concat(concat(s, to_string(self.count[name])), "|")
+    s = concat(concat(s, to_string(self.mult[name])), "|")
+    s = concat(concat(s, to_string(self.floor[name])), "|")
+    s = concat(concat(s, to_string(self.best[name])), "|")
+    s = concat(concat(s, who), "|")
+    s = concat(concat(s, to_string(self.shares[name])), "|")
+    s = concat(concat(s, to_string(self.window_end[name])), "|")
+    s = concat(concat(s, to_string(self.window_len[name])), "|")
+    return concat(s, to_string(self.stage[name]))
+  }
+
+  view fn names_count(): u128 {
+    return self.name_count
+  }
+
+  view fn name_at(i: u128): string {
+    return self.name_at_i[i]
+  }
+
+  // name|index for a fraction token
+  view fn fraction_of(token_id: u128): string {
+    require(token_id < self.next_id, "mine: no such token")
+    return concat(concat(self.token_name[token_id], "|"), to_string(self.token_index[token_id]))
+  }
+
+  // fraction token ids held by addr, comma separated, the first 50
+  view fn fractions_of(addr: address): string {
+    let total: u128 = self.balances[addr]
+    let out: string = ""
+    for i in 0..50 {
+      if i < total {
+        if len(out) > 0 { out = concat(out, ",") }
+        out = concat(out, to_string(self.owned_at[addr][i]))
+      }
+    }
+    return out
+  }
+
+  view fn held_of(name: string, addr: address): u128 {
+    return self.held[_key(name, addr)]
+  }
+
+  view fn points_of(addr: address): u128 {
+    return self.points[addr]
+  }
+
+  view fn name_points_of(name: string, addr: address): u128 {
+    return self.name_points[_key(name, addr)]
+  }
+
+  // price_per_fraction|fractions_needed|fractions_held|total_to_pay for addr
+  view fn buyout_quote(name: string, addr: address): string {
+    require(self.stage[name] == 1, "mine: not every fraction is mined")
+    let each: u128 = _buyout_price(name)
+    let have: u128 = self.held[_key(name, addr)]
+    let total: u128 = 0
+    if have >= _needed(name) { total = _mul(each, self.count[name] - have) }
+    let s: string = concat(to_string(each), "|")
+    s = concat(concat(s, to_string(_needed(name))), "|")
+    s = concat(concat(s, to_string(have)), "|")
+    return concat(s, to_string(total))
+  }
+
+  view fn withdrawable_of(addr: address): u128 {
+    return self.owed[addr]
+  }
+
+  view fn combined_total(): u128 {
+    return self.combined_count
+  }
+
+  // name|owner|epoch for a combined set
+  view fn combined_at(i: u128): string {
+    require(i < self.combined_count, "mine: no such record")
+    let s: string = concat(self.combined_name[i], "|")
+    s = concat(concat(s, to_string(self.combined_to[i])), "|")
+    return concat(s, to_string(self.combined_epoch[i]))
+  }
+
+  // base_window|start_floor|rate|rate_epoch|buyout_multiple|buyout_bps|paused
+  view fn get_settings(): string {
+    let s: string = concat(to_string(self.base_window), "|")
+    s = concat(concat(s, to_string(self.start_floor)), "|")
+    s = concat(concat(s, to_string(self.rate)), "|")
+    s = concat(concat(s, to_string(self.rate_epoch)), "|")
+    s = concat(concat(s, to_string(self.buyout_multiple)), "|")
+    s = concat(concat(s, to_string(self.buyout_bps)), "|")
+    return concat(s, to_string(self.paused))
+  }
+
+  // ---- admin ----
+
+  // Lists a reserved ONS name for mining. salt makes the first seed; the name must be reserved in
+  // ONS and set aside there for the minter (set_claimer), which this contract cannot check.
+  fn list_name(name: string, salt: string): bool {
+    only_admin()
+    require(self.listed[name] == 0, "mine: already listed")
+    let n: u128 = len(name)
+    require(n >= 3 && n <= 5, "mine: 3, 4 or 5 characters")
+    require(_plain(name) == 1, "mine: a-z and 0-9 only")
+
+    let m: u128 = _multiplier(name)
+    let base: u128 = 4
+    let factor: u128 = 1
+    if n == 4 { base = 8 }
+    if n == 4 { factor = 2 }
+    if n == 3 { base = 16 }
+    if n == 3 { factor = 4 }
+    let k: u128 = base
+    if m == 2 { k = base + base / 2 }
+    if m == 4 { k = base * 2 }
+
+    self.listed[name] = 1
+    self.count[name] = k
+    self.mult[name] = m
+    self.window_len[name] = _mul(_mul(self.base_window, factor), m)
+    self.floor[name] = self.start_floor
+    let first: string = concat(concat(concat("ons-seed|", name), "|"), salt)
+    self.seed[name] = to_string(sha256(concat(concat(first, "|"), to_string(epoch))))
+    self.name_at_i[self.name_count] = name
+    self.name_count = _sum(self.name_count, 1)
+    _open_window(name)
+    emit Listed(name, k, self.window_len[name])
+    return true
+  }
+
+  // Takes a name off the list, only before its first fraction is won.
+  fn unlist(name: string): bool {
+    only_admin()
+    require(self.listed[name] == 1, "mine: not listed")
+    require(self.index[name] == 0, "mine: a fraction is already won")
+    self.listed[name] = 0
+    emit Unlisted(name)
+    return true
+  }
+
+  // the base window in epochs, and the floor a newly listed name starts with
+  fn set_window(base_epochs: u128, start_floor: u128): bool {
+    only_admin()
+    require(base_epochs > 0, "mine: window is zero")
+    require(start_floor > 0 && start_floor <= MAX_FLOOR, "mine: floor out of range")
+    self.base_window = base_epochs
+    self.start_floor = start_floor
+    return true
+  }
+
+  // the multiple of the yearly price, and the share of fractions a buyer must hold, in bps
+  fn set_buyout(multiple: u128, need_bps: u128): bool {
+    only_admin()
+    require(multiple > 0, "mine: multiple is zero")
+    require(need_bps > 0 && need_bps <= BPS, "mine: share out of range")
+    self.buyout_multiple = multiple
+    self.buyout_bps = need_bps
+    return true
+  }
+
+  // a buyout price per fraction for one name, in micro-OCT; it applies PRICE_DELAY epochs from now,
+  // so holders can see a change before it can be used. 0 goes back to the formula.
+  fn set_buyout_price(name: string, micro: u128): bool {
+    only_admin()
+    require(self.listed[name] == 1, "mine: not listed")
+    self.price_override[name] = micro
+    if micro == 0 {
+      self.override_from[name] = 0
+    } else {
+      self.override_from[name] = _sum(epoch, PRICE_DELAY)
+    }
+    return true
+  }
+
+  fn set_prices(p3: u128, p4: u128, p5: u128): bool {
+    only_admin()
+    require(p3 > 0 && p4 > 0 && p5 > 0, "mine: price is zero")
+    self.price_3 = p3
+    self.price_4 = p4
+    self.price_5 = p5
+    return true
+  }
+
+  // micro-OCT per USD, written by the feeder with ONS's own
+  fn set_rate(rate: u128): bool {
+    require(caller == self.feeder, "mine: not feeder")
+    require(rate > 0, "mine: rate is zero")
+    self.rate = rate
+    self.rate_epoch = epoch
+    return true
+  }
+
+  // role: 1 feeder
+  fn set_role(role: u128, addr: address): bool {
+    only_admin()
+    assert_address(addr)
+    require(role == 1, "mine: unknown role")
+    self.feeder = addr
+    return true
+  }
+
+  fn set_paused(on: u128): bool {
+    only_admin()
+    require(on <= 1, "mine: on must be 0 or 1")
+    self.paused = on
+    return true
+  }
+
+  fn set_base_uri(uri: string): bool {
+    only_admin()
+    require(len(uri) <= 200, "mine: uri too long")
+    self.base_uri = uri
+    return true
+  }
+
+  fn transfer_admin(addr: address): bool {
+    only_admin()
+    assert_address(addr)
+    self.pending_admin = addr
+    return true
+  }
+
+  fn accept_admin(): bool {
+    require(caller == self.pending_admin, "mine: not the pending admin")
+    self.admin = caller
+    self.pending_admin = self.nobody
+    return true
+  }
+}

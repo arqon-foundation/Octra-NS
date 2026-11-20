@@ -1,0 +1,1494 @@
+Program ons_v2 {
+
+  // SPDX-License-Identifier: MIT
+  //
+  // Octra Name System. A .oct name is an XNS-1 token that points to one Circle or one wallet.
+  // Amounts are micro-OCT (1 OCT = 1,000,000). Time is Unix seconds, taken from the fed clock.
+
+  event Minted(token_id: u128, owner: address, creator: address)
+  event Transferred(token_id: u128, from: address, to: address)
+  event Burned(token_id: u128, owner: address, total_supply: u128)
+  event Approved(token_id: u128, approved: address)
+  event ApprovalRevoked(token_id: u128)
+  event OperatorSet(owner: address, operator: address, approved: u128)
+  event OwnershipTransferred(old_owner: address, new_owner: address)
+
+  event Registered(token_id: u128, name: string, owner: address, expires: u128, paid: u128)
+  event Renewed(token_id: u128, expires: u128, paid: u128)
+  event TargetSet(token_id: u128, kind: u128)
+  event CircleRequested(token_id: u128, circle_id: string, owner: address)
+  event CircleConfirmed(token_id: u128, circle_id: string)
+  event CircleRejected(token_id: u128, circle_id: string)
+  event PrimarySet(addr: address, token_id: u128)
+  event PrimaryCleared(addr: address)
+  event ReservedSet(name: string, on: u128)
+  event FeedUpdated(clock: u128, rate: u128)
+  event PricesSet(p3: u128, p4: u128, p5: u128)
+  event DiscountsSet(d2: u128, d3: u128, d4: u128, d5: u128)
+  event RoyaltySet(bps: u128)
+  event SplitSet(team_bps: u128)
+  event Withdrawn(to: address, amount: u128)
+  event AllowlistSet(on: u128)
+  event AllowSet(addr: address, on: u128)
+  event ProtectedSet(name: string, on: u128)
+  event ClaimerSet(name: string, addr: address, on: u128)
+  event AuctionOpened(name: string, min_bid: u128, ends: u128)
+  event BidPlaced(name: string, bidder: address, amount: u128, ends: u128)
+  event AuctionSettled(name: string, winner: address, price: u128)
+  event AuctionCancelled(name: string)
+  event BidWithdrawn(to: address, amount: u128)
+
+  const LETTERS: string = "abcdefghijklmnopqrstuvwxyz0123456789-"
+  const DIGITS:  string = "0123456789"
+
+  const MIN_PUBLIC_LEN:  u128 = 3
+  const MAX_LEN:         u128 = 32
+  const MAX_YEARS:       u128 = 5
+  const MAX_DISCOUNT_BPS: u128 = 5000
+  const MAX_ROYALTY_BPS: u128 = 1000
+  const MAX_CIRCLE_LEN:  u128 = 128
+  const MAX_URI_LEN:     u128 = 200
+  const MAX_PAGE:        u128 = 50
+  const INTERFACE_VERSION: u128 = 7
+  const CIRCLE_COOLDOWN: u128 = 20
+  const PREMIUM_DAYS:    u128 = 21
+  const PREMIUM_END_DIVISOR: u128 = 2097152
+  const DAY:             u128 = 86400
+  const BPS:             u128 = 10000
+  const MIN_RAISE_BPS:   u128 = 500
+  // a bid this close to the end, in epochs (about an hour), pushes the end back by as much
+  const EXTEND_EPOCHS:   u128 = 300
+
+  const KIND_NONE:   u128 = 0
+  const KIND_CIRCLE: u128 = 1
+  const KIND_WALLET: u128 = 2
+
+  state {
+    admin: address
+    pending_admin: address
+    nobody: address
+    feeder: address
+    verifier: address
+    treasury: address
+    team: address
+    // may issue only reserved names set aside for it with set_claimer, for fraction mining
+    minter: address
+    paused: u128
+
+    clock: u128
+    feed_epoch: u128
+    clock_epoch: u128
+    min_secs_per_epoch: u128
+    micro_oct_per_usd: u128
+    max_clock_step: u128
+    max_secs_per_epoch: u128
+    max_rate_bps: u128
+    stale_epochs: u128
+
+    // USD cents per year
+    price_3: u128
+    price_4: u128
+    price_5: u128
+    // share taken off the yearly fee when several years are paid at once, by number of years
+    discount: map[u128]u128
+
+    year_seconds: u128
+    grace_seconds: u128
+
+    royalty_bps: u128
+    team_bps: u128
+    treasury_balance: u128
+    team_balance: u128
+    base_uri: string
+
+    next_id: u128
+    burned_count: u128
+    // token id + 1, or 0 when the name has no token
+    id_plus_one: map[string]u128
+    name_of: map[u128]string
+    token_owner: map[u128]address
+    expires: map[u128]u128
+    kind: map[u128]u128
+    circle: map[u128]string
+    wallet: map[u128]address
+
+    // a Circle link resolves only after the verifier has confirmed that the name's owner deployed the Circle
+    circle_ok: map[u128]u128
+    circle_asked_epoch: map[u128]u128
+    queue_at: map[u128]u128
+    queue_head: u128
+    queue_tail: u128
+
+    balances: map[address]u128
+    owned_at: map[address]map[u128]u128
+    owned_index: map[u128]u128
+    approvals: map[u128]address
+    operator_approvals: map[address]map[address]u128
+
+    // token id + 1
+    primary: map[address]u128
+    reserved: map[string]u128
+
+    // while on, only listed wallets may register
+    allowlist_on: u128
+    allowed: map[string]u128
+
+    // token id + 1, keyed by the address as text, for batch lookups
+    primary_text: map[string]u128
+
+    // reserved names that are never auctioned
+    protected: map[string]u128
+    // the one wallet allowed to register a reserved name itself
+    claimer: map[string]address
+    // when a lapsed name became free again; drives the premium on valuable names
+    open_from: map[string]u128
+    premium_start: u128
+
+    // the one auction that can be open; auc_name is empty when none is
+    auc_name: string
+    auc_min: u128
+    auc_open_at: u128
+    auc_end: u128
+    auc_top: u128
+    auc_bidder: address
+    auc_first_bid: u128
+
+    // every bid ever placed, in order
+    bid_count: u128
+    bid_who: map[u128]address
+    bid_amount: map[u128]u128
+    bid_when: map[u128]u128
+
+    // outbid money waiting for its bidder to withdraw
+    refunds: map[address]u128
+
+    // finished auctions, oldest first
+    sold_count: u128
+    sold_name: map[u128]string
+    sold_to: map[u128]address
+    sold_price: map[u128]u128
+    sold_when: map[u128]u128
+    sold_min: map[u128]u128
+    sold_open_at: map[u128]u128
+    sold_end: map[u128]u128
+    sold_first_bid: map[u128]u128
+    sold_bids: map[u128]u128
+  }
+
+  // No arguments: with two or more, the network's Program admission refuses every loop in the
+  // program. The deployer holds every role until set_role moves it; set_periods and set_base_uri
+  // set the rest.
+  constructor() {
+    self.admin = caller
+    self.feeder = caller
+    self.verifier = caller
+    self.treasury = caller
+    self.team = caller
+    self.year_seconds = 31536000
+    self.grace_seconds = 7776000
+    self.base_uri = ""
+
+    self.price_3 = 64000
+    self.price_4 = 16000
+    self.price_5 = 500
+    self.discount[2] = 500
+    self.discount[3] = 1000
+    self.discount[4] = 1500
+    self.discount[5] = 2000
+    self.royalty_bps = 250
+    self.allowlist_on = 1
+    // 100,000,000 OCT
+    self.premium_start = 100000000000000
+    self.team_bps = 1000
+    self.max_clock_step = 172800
+    self.max_secs_per_epoch = 120
+    self.min_secs_per_epoch = 10
+    self.minter = self.nobody
+    // a text field that was never written does not read as empty, so it is written here
+    self.auc_name = ""
+    self.max_rate_bps = 5000
+    self.stale_epochs = 10000
+  }
+
+  // ---- internal ----
+
+  private fn only_admin() {
+    require(caller == self.admin, "ons: not admin")
+  }
+
+  private fn _sum(a: u128, b: u128): u128 {
+    let c: u128 = a + b
+    require(c >= a, "ons: overflow")
+    return c
+  }
+
+  private fn _mul(a: u128, b: u128): u128 {
+    if a == 0 { return 0 }
+    let c: u128 = a * b
+    require(c / a == b, "ons: overflow")
+    return c
+  }
+
+  // 0 ok, 1 too short, 2 too long, 3 bad character, 4 hyphen at an end
+  // 1 when every character is allowed. Loops sit only in functions of one argument: the network's
+  // Program admission refuses a loop in a function that takes two or more.
+  private fn _chars_ok(name: string): u128 {
+    let n: u128 = len(name)
+    for i in 0..32 {
+      if i < n {
+        let p: int = index_of(LETTERS, substr(name, i, 1))
+        if p < 0 { return 0 }
+      }
+    }
+    return 1
+  }
+
+  private fn _check(name: string, min_len: u128): u128 {
+    let n: u128 = len(name)
+    if n < min_len { return 1 }
+    if n > MAX_LEN { return 2 }
+    if _chars_ok(name) == 0 { return 3 }
+    if substr(name, 0, 1) == "-" { return 4 }
+    if substr(name, n - 1, 1) == "-" { return 4 }
+    return 0
+  }
+
+  // reserved: on the list, shorter than a public name, or one of the numbers 1 to 1000
+  private fn _is_reserved(name: string): u128 {
+    if self.reserved[name] == 1 { return 1 }
+    let n: u128 = len(name)
+    if n < MIN_PUBLIC_LEN { return 1 }
+    if name == "1000" { return 1 }
+    if n > 3 { return 0 }
+    for i in 0..3 {
+      if i < n {
+        let c: string = substr(name, i, 1)
+        let p: int = index_of(DIGITS, c)
+        if p < 0 { return 0 }
+      }
+    }
+    return 1
+  }
+
+  // 0 free, 1 active, 2 grace
+  private fn _state(name: string): u128 {
+    let v: u128 = self.id_plus_one[name]
+    if v == 0 { return 0 }
+    let exp: u128 = self.expires[v - 1]
+    if self.clock <= exp { return 1 }
+    if self.clock <= exp + self.grace_seconds { return 2 }
+    return 0
+  }
+
+  private fn _fresh() {
+    require(self.clock > 0, "ons: feed not started")
+    require(epoch >= self.feed_epoch, "ons: bad epoch")
+    require(epoch - self.feed_epoch <= self.stale_epochs, "ons: feed is stale")
+  }
+
+  private fn _price(name: string, years: u128): u128 {
+    require(years >= 1, "ons: years is zero")
+    require(years <= MAX_YEARS, "ons: too many years")
+    let n: u128 = len(name)
+    let cents: u128 = self.price_5
+    if n <= 3 { cents = self.price_3 }
+    if n == 4 { cents = self.price_4 }
+    let full: u128 = _mul(_mul(cents, years), self.micro_oct_per_usd) / 100
+    let off: u128 = _mul(full, self.discount[years]) / BPS
+    require(off <= full, "ons: bad discount")
+    return full - off
+  }
+
+  private fn _take(amount: u128) {
+    let team_cut: u128 = _mul(amount, self.team_bps) / BPS
+    require(team_cut <= amount, "ons: bad split")
+    let rest: u128 = amount - team_cut
+
+    let team_next: u128 = self.team_balance + team_cut
+    require(team_next >= self.team_balance, "ons: overflow")
+    self.team_balance = team_next
+
+    let treasury_next: u128 = self.treasury_balance + rest
+    require(treasury_next >= self.treasury_balance, "ons: overflow")
+    self.treasury_balance = treasury_next
+  }
+
+  private fn _collect(price: u128) {
+    require(value >= price, "ons: not enough sent")
+    _take(price)
+    if value > price {
+      let ok: bool = transfer(caller, value - price)
+      require(ok, "ons: refund failed")
+    }
+  }
+
+  private fn _hold(addr: address, id: u128) {
+    let i: u128 = self.balances[addr]
+    self.owned_at[addr][i] = id
+    self.owned_index[id] = i
+    self.balances[addr] = _sum(i, 1)
+  }
+
+  private fn _drop(addr: address, id: u128) {
+    require(self.balances[addr] >= 1, "ons: zero balance")
+    let last: u128 = self.balances[addr] - 1
+    let i: u128 = self.owned_index[id]
+    if i != last {
+      let moved: u128 = self.owned_at[addr][last]
+      self.owned_at[addr][i] = moved
+      self.owned_index[moved] = i
+    }
+    self.owned_at[addr][last] = 0
+    self.owned_index[id] = 0
+    self.balances[addr] = last
+  }
+
+  private fn _live_supply(): u128 {
+    require(self.next_id >= self.burned_count, "ons: supply underflow")
+    return self.next_id - self.burned_count
+  }
+
+  // retires the token of a name that ran past its grace period
+  private fn _retire(name: string) {
+    let v: u128 = self.id_plus_one[name]
+    if v != 0 {
+      let id: u128 = v - 1
+      let old: address = self.token_owner[id]
+      _drop(old, id)
+      self.token_owner[id] = self.nobody
+      self.approvals[id] = self.nobody
+      self.kind[id] = KIND_NONE
+      self.circle[id] = ""
+      self.circle_ok[id] = 0
+      self.wallet[id] = self.nobody
+      self.id_plus_one[name] = 0
+      self.open_from[name] = self.expires[id] + self.grace_seconds
+      self.burned_count = _sum(self.burned_count, 1)
+      emit Burned(id, old, _live_supply())
+    }
+  }
+
+  private fn _mint(name: string, to: address, until: u128): u128 {
+    let id: u128 = self.next_id
+    self.next_id = _sum(id, 1)
+    self.id_plus_one[name] = _sum(id, 1)
+    self.open_from[name] = 0
+    self.claimer[name] = self.nobody
+    self.name_of[id] = name
+    self.token_owner[id] = to
+    self.expires[id] = until
+    _hold(to, id)
+    emit Minted(id, to, self.treasury)
+    emit Transferred(id, self.nobody, to)
+    return id
+  }
+
+  // when a lapsed name became free again, or 0 if it never lapsed or is still held.
+  // A lapsed name keeps its old token until someone registers it, so that case is read from the token.
+  private fn _open_since(name: string): u128 {
+    let v: u128 = self.id_plus_one[name]
+    if v == 0 { return self.open_from[name] }
+    let exp: u128 = self.expires[v - 1]
+    if self.clock <= exp { return 0 }
+    if self.clock - exp <= self.grace_seconds { return 0 }
+    return exp + self.grace_seconds
+  }
+
+  // extra price on a valuable name that has just lapsed: halves every day, gone after 21
+  private fn _premium(name: string): u128 {
+    if _is_reserved(name) == 0 { return 0 }
+    let since: u128 = _open_since(name)
+    if since == 0 { return 0 }
+    if self.clock <= since { return self.premium_start }
+    let days: u128 = (self.clock - since) / DAY
+    if days >= PREMIUM_DAYS { return 0 }
+    let now_value: u128 = self.premium_start
+    for i in 0..21 {
+      if i < days { now_value = now_value / 2 }
+    }
+    // what the curve would reach on the last day, taken off so the premium ends at exactly zero
+    let end_value: u128 = self.premium_start / PREMIUM_END_DIVISOR
+    if now_value <= end_value { return 0 }
+    return now_value - end_value
+  }
+
+  // the token exists and its name has not run past grace
+  private fn _require_live(token_id: u128) {
+    require(token_id < self.next_id, "ons: token not found")
+    require(self.token_owner[token_id] != self.nobody, "ons: token burned")
+    require(self.clock <= self.expires[token_id] + self.grace_seconds, "ons: name lapsed")
+  }
+
+  private fn _require_active(token_id: u128) {
+    _require_live(token_id)
+    require(self.clock <= self.expires[token_id], "ons: name expired")
+  }
+
+  private fn _owned_active(name: string): u128 {
+    let v: u128 = self.id_plus_one[name]
+    require(v != 0, "ons: name not registered")
+    let id: u128 = v - 1
+    _require_active(id)
+    require(caller == self.token_owner[id], "ons: not owner")
+    return id
+  }
+
+  private fn _move(token_id: u128, from: address, to: address) {
+    _drop(from, token_id)
+    _hold(to, token_id)
+    self.token_owner[token_id] = to
+    self.approvals[token_id] = self.nobody
+
+    // a name never keeps pointing where a previous owner chose
+    if self.kind[token_id] != KIND_NONE {
+      self.kind[token_id] = KIND_NONE
+      self.circle[token_id] = ""
+      self.circle_ok[token_id] = 0
+      self.wallet[token_id] = self.nobody
+      emit TargetSet(token_id, KIND_NONE)
+    }
+    if self.primary[from] == _sum(token_id, 1) {
+      self.primary[from] = 0
+      self.primary_text[to_string(from)] = 0
+      emit PrimaryCleared(from)
+    }
+
+    emit Transferred(token_id, from, to)
+  }
+
+  // ---- registration ----
+
+  // The caller pays; the name is issued to `to`.
+  private fn _register(name: string, to: address, years: u128): u128 {
+    require(self.paused == 0, "ons: paused")
+    // a wallet the admin named for a reserved name may register it at the plain yearly price
+    let claimed: u128 = 0
+    if _is_reserved(name) == 1 && self.claimer[name] == caller { claimed = 1 }
+    if self.allowlist_on == 1 && claimed == 0 {
+      require(self.allowed[to_string(caller)] == 1, "ons: wallet not on the allowlist")
+    }
+    _fresh()
+    require(_check(name, 1) == 0, "ons: bad name")
+    require(_state(name) == 0, "ons: name taken")
+    if self.id_plus_one[name] != 0 {
+      _retire(name)
+    }
+    if _is_reserved(name) == 1 && claimed == 0 {
+      require(self.protected[name] == 0 && self.open_from[name] != 0, "ons: name reserved")
+    }
+    require(self.auc_name != name, "ons: name is in an auction")
+
+    let price: u128 = _price(name, years)
+    if claimed == 0 { price = _sum(price, _premium(name)) }
+    require(price > 0, "ons: price is zero")
+    _collect(price)
+
+    let until: u128 = _sum(self.clock, _mul(years, self.year_seconds))
+    let id: u128 = _mint(name, to, until)
+    emit Registered(id, name, to, until, price)
+    return id
+  }
+
+  payable fn register(name: string, years: u128): u128 {
+    return _register(name, caller, years)
+  }
+
+  // registers a name for another wallet; the caller pays
+  payable fn register_for(name: string, to: address, years: u128): u128 {
+    assert_address(to)
+    return _register(name, to, years)
+  }
+
+  payable fn renew(name: string, years: u128): u128 {
+    require(self.paused == 0, "ons: paused")
+    _fresh()
+    let st: u128 = _state(name)
+    require(st != 0, "ons: name not registered")
+
+    let price: u128 = _price(name, years)
+    require(price > 0, "ons: price is zero")
+    _collect(price)
+
+    let id: u128 = self.id_plus_one[name] - 1
+    let until: u128 = _sum(self.expires[id], _mul(years, self.year_seconds))
+    self.expires[id] = until
+    emit Renewed(id, until, price)
+    return until
+  }
+
+  // ---- what a name points to ----
+
+  // Asks for the name to point at a Circle. It starts pending and resolves once the
+  // verifier has confirmed that the caller deployed that Circle.
+  fn set_circle(name: string, circle_id: string): bool {
+    let id: u128 = _owned_active(name)
+    require(len(circle_id) > 0, "ons: circle empty")
+    require(len(circle_id) <= MAX_CIRCLE_LEN, "ons: circle too long")
+    let asked: u128 = self.circle_asked_epoch[id]
+    require(asked == 0 || epoch >= asked + CIRCLE_COOLDOWN, "ons: wait before asking again")
+
+    self.kind[id] = KIND_CIRCLE
+    self.circle[id] = circle_id
+    self.circle_ok[id] = 0
+    self.wallet[id] = self.nobody
+    self.circle_asked_epoch[id] = epoch
+
+    self.queue_at[self.queue_tail] = id
+    self.queue_tail = _sum(self.queue_tail, 1)
+
+    emit TargetSet(id, KIND_CIRCLE)
+    emit CircleRequested(id, circle_id, caller)
+    return true
+  }
+
+  // The verifier settles the oldest request: ok is 1 when the Circle's owner is the name's owner.
+  fn resolve_circle(token_id: u128, circle_id: string, ok: u128): bool {
+    require(caller == self.verifier, "ons: not verifier")
+    require(ok <= 1, "ons: ok must be 0 or 1")
+    require(self.queue_head < self.queue_tail, "ons: nothing pending")
+    require(self.queue_at[self.queue_head] == token_id, "ons: not the oldest request")
+    self.queue_head = _sum(self.queue_head, 1)
+
+    // a request is stale when the name has since moved on to another target
+    if self.kind[token_id] == KIND_CIRCLE && self.circle_ok[token_id] == 0 && self.circle[token_id] == circle_id {
+      if ok == 1 {
+        self.circle_ok[token_id] = 1
+        emit CircleConfirmed(token_id, circle_id)
+      } else {
+        self.kind[token_id] = KIND_NONE
+        self.circle[token_id] = ""
+        emit TargetSet(token_id, KIND_NONE)
+        emit CircleRejected(token_id, circle_id)
+      }
+    }
+    return true
+  }
+
+  fn set_wallet(name: string, addr: address): bool {
+    let id: u128 = _owned_active(name)
+    assert_address(addr)
+    self.kind[id] = KIND_WALLET
+    self.wallet[id] = addr
+    self.circle[id] = ""
+    self.circle_ok[id] = 0
+    emit TargetSet(id, KIND_WALLET)
+    return true
+  }
+
+  fn clear_target(name: string): bool {
+    let id: u128 = _owned_active(name)
+    self.kind[id] = KIND_NONE
+    self.circle[id] = ""
+    self.circle_ok[id] = 0
+    self.wallet[id] = self.nobody
+    emit TargetSet(id, KIND_NONE)
+    return true
+  }
+
+  fn set_primary(name: string): bool {
+    let id: u128 = _owned_active(name)
+    require(self.kind[id] == KIND_WALLET, "ons: not a wallet name")
+    require(self.wallet[id] == caller, "ons: name points elsewhere")
+    self.primary[caller] = _sum(id, 1)
+    self.primary_text[to_string(caller)] = _sum(id, 1)
+    emit PrimarySet(caller, id)
+    return true
+  }
+
+  fn clear_primary(): bool {
+    self.primary[caller] = 0
+    self.primary_text[to_string(caller)] = 0
+    emit PrimaryCleared(caller)
+    return true
+  }
+
+  // ---- auctions of reserved names ----
+
+  // Places a bid. The first must reach the minimum; each later one must beat the leader by 5%.
+  // The caller sends only what is missing: money they already have in the auction is counted.
+  // A bidder who is passed can take their money back with withdraw_bid, or leave it for a new bid.
+  payable fn auction_bid(): bool {
+    require(self.paused == 0, "ons: paused")
+    if self.allowlist_on == 1 {
+      require(self.allowed[to_string(caller)] == 1, "ons: wallet not on the allowlist")
+    }
+    require(len(self.auc_name) > 0, "ons: no auction")
+    require(epoch <= self.auc_end, "ons: auction ended")
+
+    let need: u128 = self.auc_min
+    if self.auc_top > 0 {
+      need = _sum(self.auc_top, _mul(self.auc_top, MIN_RAISE_BPS) / BPS)
+      if need == self.auc_top { need = _sum(need, 1) }
+    }
+    // what the caller already has in the auction counts towards the new bid: their own
+    // leading bid, and any earlier bid of theirs that was passed and not withdrawn
+    let own: u128 = 0
+    if self.auc_top > 0 && self.auc_bidder == caller { own = self.auc_top }
+    let amount: u128 = _sum(_sum(value, self.refunds[caller]), own)
+    require(amount >= need, "ons: bid too low")
+    self.refunds[caller] = 0
+
+    if own == 0 && self.auc_top > 0 {
+      // the bid that was passed is set aside for its bidder to withdraw or bid with again
+      let passed: address = self.auc_bidder
+      let held: u128 = self.refunds[passed] + self.auc_top
+      require(held >= self.refunds[passed], "ons: overflow")
+      self.refunds[passed] = held
+    }
+    self.auc_top = amount
+    self.auc_bidder = caller
+
+    self.bid_who[self.bid_count] = caller
+    self.bid_amount[self.bid_count] = amount
+    self.bid_when[self.bid_count] = self.clock
+    self.bid_count = _sum(self.bid_count, 1)
+
+    // a late bid keeps the auction open, so the last moment cannot decide it
+    if self.auc_end - epoch < EXTEND_EPOCHS {
+      self.auc_end = _sum(epoch, EXTEND_EPOCHS)
+    }
+
+    emit BidPlaced(self.auc_name, caller, amount, self.auc_end)
+    return true
+  }
+
+  // Closes an auction whose time is up. Anyone may call it. The leading bidder receives the
+  // name for one year, and their bid is the price paid. A pause holds bidding and closing alike.
+  fn auction_settle(): bool {
+    require(self.paused == 0, "ons: paused")
+    require(len(self.auc_name) > 0, "ons: no auction")
+    require(epoch > self.auc_end, "ons: auction still open")
+    let name: string = self.auc_name
+
+    if self.auc_top > 0 {
+      let winner: address = self.auc_bidder
+      let price: u128 = self.auc_top
+      if self.id_plus_one[name] != 0 {
+        _retire(name)
+      }
+      _take(price)
+      let until: u128 = _sum(self.clock, self.year_seconds)
+      let id: u128 = _mint(name, winner, until)
+
+      self.sold_name[self.sold_count] = name
+      self.sold_to[self.sold_count] = winner
+      self.sold_price[self.sold_count] = price
+      self.sold_when[self.sold_count] = self.clock
+      self.sold_min[self.sold_count] = self.auc_min
+      self.sold_open_at[self.sold_count] = self.auc_open_at
+      self.sold_end[self.sold_count] = self.auc_end
+      self.sold_first_bid[self.sold_count] = self.auc_first_bid
+      self.sold_bids[self.sold_count] = self.bid_count - self.auc_first_bid
+      self.sold_count = _sum(self.sold_count, 1)
+
+      emit AuctionSettled(name, winner, price)
+      emit Registered(id, name, winner, until, price)
+    } else {
+      emit AuctionCancelled(name)
+    }
+
+    self.auc_name = ""
+    self.auc_min = 0
+    self.auc_open_at = 0
+    self.auc_end = 0
+    self.auc_top = 0
+    self.auc_bidder = self.nobody
+    return true
+  }
+
+  // Takes back every bid of the caller's that has been outbid.
+  fn withdraw_bid(): u128 {
+    let amount: u128 = self.refunds[caller]
+    require(amount > 0, "ons: nothing to withdraw")
+    self.refunds[caller] = 0
+    let ok: bool = transfer(caller, amount)
+    require(ok, "ons: transfer failed")
+    emit BidWithdrawn(caller, amount)
+    return amount
+  }
+
+  // ---- XNS-1 ----
+
+  fn transfer(to: address, token_id: u128): bool {
+    _require_active(token_id)
+    assert_address(to)
+
+    let current_owner: address = self.token_owner[token_id]
+    require(caller == current_owner, "ons: not owner")
+    require(to != current_owner, "ons: already owner")
+
+    _move(token_id, current_owner, to)
+    return true
+  }
+
+  fn transfer_from(from: address, to: address, token_id: u128): bool {
+    _require_active(token_id)
+    assert_address(from)
+    assert_address(to)
+
+    let current_owner: address = self.token_owner[token_id]
+    require(from == current_owner, "ons: from is not owner")
+    require(to != current_owner, "ons: already owner")
+
+    let approved: address = self.approvals[token_id]
+    let is_operator: u128 = self.operator_approvals[from][caller]
+    require(
+      caller == current_owner || caller == approved || is_operator == 1,
+      "ons: not authorized"
+    )
+
+    _move(token_id, from, to)
+    return true
+  }
+
+  fn approve(approved: address, token_id: u128): bool {
+    _require_active(token_id)
+    assert_address(approved)
+
+    let current_owner: address = self.token_owner[token_id]
+    let is_operator: u128 = self.operator_approvals[current_owner][caller]
+    require(caller == current_owner || is_operator == 1, "ons: not authorized")
+
+    self.approvals[token_id] = approved
+    emit Approved(token_id, approved)
+    return true
+  }
+
+  fn revoke_approval(token_id: u128): bool {
+    _require_live(token_id)
+
+    let current_owner: address = self.token_owner[token_id]
+    let is_operator: u128 = self.operator_approvals[current_owner][caller]
+    require(caller == current_owner || is_operator == 1, "ons: not authorized")
+
+    self.approvals[token_id] = self.nobody
+    emit ApprovalRevoked(token_id)
+    return true
+  }
+
+  fn set_operator(operator: address, approved: u128): bool {
+    assert_address(operator)
+    require(operator != caller, "ons: cannot self-operate")
+    require(approved <= 1, "ons: approved must be 0 or 1")
+
+    self.operator_approvals[caller][operator] = approved
+    emit OperatorSet(caller, operator, approved)
+    return true
+  }
+
+  view fn owner_of(token_id: u128): address {
+    _require_live(token_id)
+    return self.token_owner[token_id]
+  }
+
+  view fn balance_of(addr: address): u128 {
+    assert_address(addr)
+    return self.balances[addr]
+  }
+
+  view fn token_uri(token_id: u128): string {
+    _require_live(token_id)
+    let uri: string = concat(self.base_uri, to_string(token_id))
+    return concat(uri, ".json")
+  }
+
+  view fn creator_of(token_id: u128): address {
+    _require_live(token_id)
+    return self.treasury
+  }
+
+  view fn royalty_of(token_id: u128): u128 {
+    _require_live(token_id)
+    return self.royalty_bps
+  }
+
+  view fn get_approved(token_id: u128): address {
+    _require_live(token_id)
+    return self.approvals[token_id]
+  }
+
+  // 1 or 0. Nobody can move a name that is in grace.
+  view fn is_approved_or_owner(token_id: u128, addr: address): u128 {
+    assert_address(addr)
+    _require_live(token_id)
+    if self.clock > self.expires[token_id] { return 0 }
+
+    let current_owner: address = self.token_owner[token_id]
+    if addr == current_owner { return 1 }
+    if self.approvals[token_id] == addr { return 1 }
+    if self.operator_approvals[current_owner][addr] == 1 { return 1 }
+    return 0
+  }
+
+  view fn total_supply(): u128 {
+    return _live_supply()
+  }
+
+  // name|symbol|total_supply|owner
+  view fn get_contract_info(): string {
+    let s: string = concat("Octra Name System|ONS|", to_string(_live_supply()))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.admin))
+    s = concat(s, "|")
+    return concat(s, to_string(INTERFACE_VERSION))
+  }
+
+  // every token ever issued has an id below this, including names that have since lapsed
+  view fn tokens_issued(): u128 {
+    return self.next_id
+  }
+
+  // discount for 1|2|3|4|5 years, in hundredths of a percent
+  view fn get_discounts(): string {
+    let s: string = concat("0|", to_string(self.discount[2]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.discount[3]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.discount[4]))
+    s = concat(s, "|")
+    return concat(s, to_string(self.discount[5]))
+  }
+
+  // year_seconds|grace_seconds
+  view fn get_periods(): string {
+    let s: string = concat(to_string(self.year_seconds), "|")
+    return concat(s, to_string(self.grace_seconds))
+  }
+
+  // kind|target for an active name: 0| when it points nowhere, 1|circle id, 2|wallet address.
+  // A Circle is given only once it has been confirmed.
+  view fn resolve(name: string): string {
+    if _state(name) != 1 { return "0|" }
+    let id: u128 = self.id_plus_one[name] - 1
+    if self.kind[id] == KIND_WALLET { return concat("2|", to_string(self.wallet[id])) }
+    if self.kind[id] == KIND_CIRCLE && self.circle_ok[id] == 1 { return concat("1|", self.circle[id]) }
+    return "0|"
+  }
+
+  // ---- reads ----
+
+  // 0 available, 1 active, 2 grace, 3 reserved, 4 invalid
+  view fn status_of(name: string): u128 {
+    if _check(name, 1) != 0 { return 4 }
+    let st: u128 = _state(name)
+    if st != 0 { return st }
+    if _is_reserved(name) == 1 {
+      if self.protected[name] == 1 || _open_since(name) == 0 { return 3 }
+    }
+    return 0
+  }
+
+  // yearly fee for the years asked, plus any premium on a valuable name that has just lapsed
+  view fn price_of(name: string, years: u128): u128 {
+    return _sum(_price(name, years), _premium(name))
+  }
+
+  view fn name_of_token(token_id: u128): string {
+    require(token_id < self.next_id, "ons: token not found")
+    return self.name_of[token_id]
+  }
+
+  // the Circle, once confirmed
+  view fn circle_of(name: string): string {
+    if _state(name) != 1 { return "" }
+    let id: u128 = self.id_plus_one[name] - 1
+    if self.kind[id] != KIND_CIRCLE { return "" }
+    if self.circle_ok[id] != 1 { return "" }
+    return self.circle[id]
+  }
+
+  // head|tail of the request queue
+  view fn pending_range(): string {
+    let s: string = concat(to_string(self.queue_head), "|")
+    return concat(s, to_string(self.queue_tail))
+  }
+
+  // token_id|name|circle_id|owner|live for the request at a queue position; live is 0 when it is stale
+  view fn pending_at(index: u128): string {
+    require(index < self.queue_tail, "ons: no such request")
+    let id: u128 = self.queue_at[index]
+    let live: u128 = 0
+    if self.kind[id] == KIND_CIRCLE && self.circle_ok[id] == 0 && self.token_owner[id] != self.nobody {
+      live = 1
+    }
+    let s: string = concat(to_string(id), "|")
+    s = concat(s, self.name_of[id])
+    s = concat(s, "|")
+    if live == 1 { s = concat(s, self.circle[id]) }
+    s = concat(s, "|")
+    s = concat(s, to_string(self.token_owner[id]))
+    s = concat(s, "|")
+    return concat(s, to_string(live))
+  }
+
+  // the wallet as text, or empty
+  view fn wallet_of(name: string): string {
+    if _state(name) != 1 { return "" }
+    let id: u128 = self.id_plus_one[name] - 1
+    if self.kind[id] != KIND_WALLET { return "" }
+    return to_string(self.wallet[id])
+  }
+
+  // empty unless the name is active, owned by addr and points back at addr
+  view fn primary_of(addr: address): string {
+    let v: u128 = self.primary[addr]
+    if v == 0 { return "" }
+    let id: u128 = v - 1
+    if self.token_owner[id] != addr { return "" }
+    if self.clock > self.expires[id] { return "" }
+    if self.kind[id] != KIND_WALLET { return "" }
+    if self.wallet[id] != addr { return "" }
+    return self.name_of[id]
+  }
+
+  // token_id|name|owner|expires|kind|circle|wallet|circle_status
+  // kind: 0 not set, 1 Circle, 2 wallet. circle_status: 0 none, 1 waiting for the verifier, 2 confirmed.
+  view fn get_name_info(name: string): string {
+    let v: u128 = self.id_plus_one[name]
+    require(v != 0, "ons: name not registered")
+    let id: u128 = v - 1
+    let s: string = concat(to_string(id), "|")
+    s = concat(s, name)
+    s = concat(s, "|")
+    s = concat(s, to_string(self.token_owner[id]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.expires[id]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.kind[id]))
+    s = concat(s, "|")
+    let circle_state: u128 = 0
+    if self.kind[id] == KIND_CIRCLE {
+      s = concat(s, self.circle[id])
+      circle_state = 1
+      if self.circle_ok[id] == 1 { circle_state = 2 }
+    }
+    s = concat(s, "|")
+    if self.kind[id] == KIND_WALLET { s = concat(s, to_string(self.wallet[id])) }
+    s = concat(s, "|")
+    return concat(s, to_string(circle_state))
+  }
+
+  // names held by addr, comma separated, the first 50
+  view fn names_of(addr: address): string {
+    let total: u128 = self.balances[addr]
+    let out: string = ""
+    for i in 0..50 {
+      let idx: u128 = i
+      if idx < total {
+        if len(out) > 0 { out = concat(out, ",") }
+        out = concat(out, self.name_of[self.owned_at[addr][idx]])
+      }
+    }
+    return out
+  }
+
+  // primary names for up to 50 comma-separated addresses, in the same order; empty where there is none
+  view fn primary_of_many(addrs: string): string {
+    let rest: string = addrs
+    let out: string = ""
+    let first: u128 = 1
+    for i in 0..50 {
+      if len(rest) > 0 {
+        let cut: int = index_of(rest, ",")
+        let who: string = rest
+        if cut < 0 {
+          rest = ""
+        } else {
+          let at: u128 = cut
+          let total: u128 = len(rest)
+          who = substr(rest, 0, at)
+          rest = substr(rest, at + 1, total - at - 1)
+        }
+        if first == 0 { out = concat(out, ",") }
+        first = 0
+        let v: u128 = self.primary_text[who]
+        if v != 0 {
+          let id: u128 = v - 1
+          if to_string(self.token_owner[id]) == who && self.clock <= self.expires[id] && self.kind[id] == KIND_WALLET && to_string(self.wallet[id]) == who {
+            out = concat(out, self.name_of[id])
+          }
+        }
+      }
+    }
+    require(len(rest) == 0, "ons: more than 50 addresses")
+    return out
+  }
+
+  // name|min_bid|top_bid|top_bidder|open_at|end|first_bid|bids|next_min for the open auction,
+  // or empty. first_bid is the index of its first bid in bid_at; next_min is the least a new bid may be.
+  view fn auction(): string {
+    if len(self.auc_name) == 0 { return "" }
+    let next: u128 = self.auc_min
+    let who: string = ""
+    if self.auc_top > 0 {
+      next = _sum(self.auc_top, _mul(self.auc_top, MIN_RAISE_BPS) / BPS)
+      if next == self.auc_top { next = _sum(next, 1) }
+      who = to_string(self.auc_bidder)
+    }
+    let s: string = concat(self.auc_name, "|")
+    s = concat(s, to_string(self.auc_min))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.auc_top))
+    s = concat(s, "|")
+    s = concat(s, who)
+    s = concat(s, "|")
+    s = concat(s, to_string(self.auc_open_at))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.auc_end))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.auc_first_bid))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.bid_count - self.auc_first_bid))
+    s = concat(s, "|")
+    return concat(s, to_string(next))
+  }
+
+  view fn bids_count(): u128 {
+    return self.bid_count
+  }
+
+  // bidder|amount|clock for one bid; bids of all auctions share one numbering
+  view fn bid_at(index: u128): string {
+    require(index < self.bid_count, "ons: no such bid")
+    let s: string = concat(to_string(self.bid_who[index]), "|")
+    s = concat(s, to_string(self.bid_amount[index]))
+    s = concat(s, "|")
+    return concat(s, to_string(self.bid_when[index]))
+  }
+
+  // outbid money waiting for this wallet to withdraw
+  view fn withdrawable_of(addr: address): u128 {
+    return self.refunds[addr]
+  }
+
+  view fn sales_count(): u128 {
+    return self.sold_count
+  }
+
+  // name|winner|price|sold_at|min_bid|open_at|end|first_bid|bids for a finished auction
+  view fn sale_at(index: u128): string {
+    require(index < self.sold_count, "ons: no such sale")
+    let s: string = concat(self.sold_name[index], "|")
+    s = concat(s, to_string(self.sold_to[index]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.sold_price[index]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.sold_when[index]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.sold_min[index]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.sold_open_at[index]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.sold_end[index]))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.sold_first_bid[index]))
+    s = concat(s, "|")
+    return concat(s, to_string(self.sold_bids[index]))
+  }
+
+  // clock|micro_oct_per_usd|feed_epoch
+  view fn feed(): string {
+    let s: string = concat(to_string(self.clock), "|")
+    s = concat(s, to_string(self.micro_oct_per_usd))
+    s = concat(s, "|")
+    return concat(s, to_string(self.feed_epoch))
+  }
+
+  // max_clock_step|max_secs_per_epoch|max_rate_bps|stale_epochs|min_secs_per_epoch
+  view fn get_feed_limits(): string {
+    let s: string = concat(to_string(self.max_clock_step), "|")
+    s = concat(s, to_string(self.max_secs_per_epoch))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.max_rate_bps))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.stale_epochs))
+    s = concat(s, "|")
+    return concat(s, to_string(self.min_secs_per_epoch))
+  }
+
+  // 1 when addr may register: the allowlist is off, or addr is on it
+  view fn is_allowed(addr: address): u128 {
+    if self.allowlist_on == 0 { return 1 }
+    return self.allowed[to_string(addr)]
+  }
+
+  // p3|p4|p5|royalty_bps|team_bps|paused|allowlist_on|premium_start|treasury_balance|team_balance
+  view fn get_settings(): string {
+    let s: string = concat(to_string(self.price_3), "|")
+    s = concat(s, to_string(self.price_4))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.price_5))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.royalty_bps))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.team_bps))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.paused))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.allowlist_on))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.premium_start))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.treasury_balance))
+    s = concat(s, "|")
+    return concat(s, to_string(self.team_balance))
+  }
+
+  // 0 not reserved, 1 reserved, 2 reserved and protected
+  // the wallet that may register this reserved name itself, or empty
+  view fn claimer_of(name: string): string {
+    if _is_reserved(name) == 0 { return "" }
+    if _state(name) != 0 { return "" }
+    let who: address = self.claimer[name]
+    if who == self.nobody { return "" }
+    return to_string(who)
+  }
+
+  view fn reserved_status(name: string): u128 {
+    if _is_reserved(name) == 0 { return 0 }
+    if self.protected[name] == 1 { return 2 }
+    return 1
+  }
+
+  // ---- feed ----
+
+  fn set_feed(now: u128, rate: u128): bool {
+    require(caller == self.feeder, "ons: not feeder")
+    require(rate > 0, "ons: rate is zero")
+
+    if self.clock == 0 {
+      require(now > 0, "ons: clock is zero")
+      self.clock = now
+      self.clock_epoch = epoch
+    } else {
+      let old: u128 = self.micro_oct_per_usd
+      let scaled: u128 = _mul(rate, BPS)
+      require(scaled <= _mul(old, BPS + self.max_rate_bps), "ons: rate moved too far")
+      require(scaled >= _mul(old, BPS - self.max_rate_bps), "ons: rate moved too far")
+      // A bid may already have moved the clock past this time; then the clock stays and only
+      // the rate is written. Otherwise it moves, never further than the chain allows.
+      if now > self.clock {
+        require(epoch >= self.clock_epoch, "ons: bad epoch")
+        let passed: u128 = epoch - self.clock_epoch
+        let step: u128 = now - self.clock
+        let most: u128 = _mul(passed, self.max_secs_per_epoch)
+        if step > most { step = most }
+        if step > self.max_clock_step { step = self.max_clock_step }
+        if step > 0 {
+          self.clock = _sum(self.clock, step)
+          self.clock_epoch = epoch
+        }
+      }
+    }
+
+    self.micro_oct_per_usd = rate
+    self.feed_epoch = epoch
+    emit FeedUpdated(self.clock, rate)
+    return true
+  }
+
+  // ---- admin ----
+
+  // reserves up to 50 names in one call: "1|name,name" protects them from auction, "0|..." does not
+  fn reserve_batch(spec: string): u128 {
+    only_admin()
+    let flag: string = substr(spec, 0, 2)
+    require(flag == "0|" || flag == "1|", "ons: start with 0| or 1|")
+    let protect: u128 = 0
+    if flag == "1|" { protect = 1 }
+    let rest: string = substr(spec, 2, len(spec) - 2)
+    let count: u128 = 0
+    for i in 0..50 {
+      if len(rest) > 0 {
+        let cut: int = index_of(rest, ",")
+        let name: string = rest
+        if cut < 0 {
+          rest = ""
+        } else {
+          let at: u128 = cut
+          let total: u128 = len(rest)
+          name = substr(rest, 0, at)
+          rest = substr(rest, at + 1, total - at - 1)
+        }
+        require(_check(name, 1) == 0, "ons: bad name")
+        self.reserved[name] = 1
+        self.protected[name] = protect
+        count = count + 1
+      }
+    }
+    require(len(rest) == 0, "ons: more than 50 names")
+    return count
+  }
+
+  // names one wallet that may register a reserved name itself, or takes that right away
+  fn set_claimer(name: string, addr: address, on: u128): bool {
+    only_admin()
+    require(on <= 1, "ons: on must be 0 or 1")
+    require(_is_reserved(name) == 1, "ons: name not reserved")
+    require(_state(name) == 0, "ons: name taken")
+    if on == 1 {
+      assert_address(addr)
+      self.claimer[name] = addr
+    } else {
+      self.claimer[name] = self.nobody
+    }
+    emit ClaimerSet(name, addr, on)
+    return true
+  }
+
+  fn set_protected(name: string, on: u128): bool {
+    only_admin()
+    require(on <= 1, "ons: on must be 0 or 1")
+    require(_is_reserved(name) == 1, "ons: name not reserved")
+    self.protected[name] = on
+    emit ProtectedSet(name, on)
+    return true
+  }
+
+  // Opens an auction for a reserved name: bids start at min_bid and it runs for duration epochs.
+  // auc_open_at and auc_end are epochs.
+  fn auction_open(name: string, min_bid: u128, duration: u128): bool {
+    only_admin()
+    require(len(self.auc_name) == 0, "ons: another auction is open")
+    require(_check(name, 1) == 0, "ons: bad name")
+    require(_is_reserved(name) == 1, "ons: name not reserved")
+    require(self.protected[name] == 0, "ons: name is protected")
+    require(_state(name) == 0, "ons: name taken")
+    require(min_bid > 0, "ons: minimum bid is zero")
+    require(duration > 0, "ons: duration is zero")
+
+    let ends: u128 = _sum(epoch, duration)
+    self.auc_name = name
+    self.auc_min = min_bid
+    self.auc_open_at = epoch
+    self.auc_end = ends
+    self.auc_top = 0
+    self.auc_bidder = self.nobody
+    self.auc_first_bid = self.bid_count
+
+    emit AuctionOpened(name, min_bid, ends)
+    return true
+  }
+
+  // Withdraws an auction nobody has bid on. Once there is a bid, it runs to its end.
+  fn auction_cancel(): bool {
+    only_admin()
+    require(len(self.auc_name) > 0, "ons: no auction")
+    require(self.auc_top == 0, "ons: auction has bids")
+    emit AuctionCancelled(self.auc_name)
+    self.auc_name = ""
+    self.auc_min = 0
+    self.auc_open_at = 0
+    self.auc_end = 0
+    return true
+  }
+
+  // issues a reserved name without payment
+  fn admin_assign(name: string, to: address, years: u128): u128 {
+    // the admin, or the minter for a reserved name whose claimer is the minter (mined names)
+    require(caller == self.admin || (caller == self.minter && self.claimer[name] == caller), "ons: not admin")
+    assert_address(to)
+    require(self.clock > 0, "ons: feed not started")
+    require(_check(name, 1) == 0, "ons: bad name")
+    require(_is_reserved(name) == 1, "ons: name not reserved")
+    require(_state(name) == 0, "ons: name taken")
+    require(self.auc_name != name, "ons: name is in an auction")
+    require(years >= 1, "ons: years is zero")
+    require(years <= MAX_YEARS, "ons: too many years")
+
+    _retire(name)
+    let until: u128 = _sum(self.clock, _mul(years, self.year_seconds))
+    let id: u128 = _mint(name, to, until)
+    emit Registered(id, name, to, until, 0)
+    return id
+  }
+
+  // yearly prices in USD cents, and the opening premium on a lapsed valuable name in micro-OCT
+  // discounts for paying 2, 3, 4 and 5 years at once, in hundredths of a percent; a longer
+  // term never gets a smaller discount than a shorter one
+  fn set_discounts(d2: u128, d3: u128, d4: u128, d5: u128): bool {
+    only_admin()
+    require(d2 <= d3 && d3 <= d4 && d4 <= d5, "ons: discounts must not shrink")
+    require(d5 <= MAX_DISCOUNT_BPS, "ons: discount too large")
+    require(_mul(2, BPS - d2) <= _mul(3, BPS - d3), "ons: longer term must not cost less")
+    require(_mul(3, BPS - d3) <= _mul(4, BPS - d4), "ons: longer term must not cost less")
+    require(_mul(4, BPS - d4) <= _mul(5, BPS - d5), "ons: longer term must not cost less")
+    self.discount[2] = d2
+    self.discount[3] = d3
+    self.discount[4] = d4
+    self.discount[5] = d5
+    emit DiscountsSet(d2, d3, d4, d5)
+    return true
+  }
+
+  fn set_prices(p3: u128, p4: u128, p5: u128, premium: u128): bool {
+    only_admin()
+    require(p3 > 0, "ons: price is zero")
+    require(p4 > 0, "ons: price is zero")
+    require(p5 > 0, "ons: price is zero")
+    self.price_3 = p3
+    self.price_4 = p4
+    self.price_5 = p5
+    self.premium_start = premium
+    emit PricesSet(p3, p4, p5)
+    return true
+  }
+
+  // royalty on sales and the team's share of income, both in hundredths of a percent
+  fn set_fees(royalty: u128, team_share: u128): bool {
+    only_admin()
+    require(royalty <= MAX_ROYALTY_BPS, "ons: royalty exceeds 10%")
+    require(team_share <= BPS, "ons: split exceeds 100%")
+    self.royalty_bps = royalty
+    self.team_bps = team_share
+    emit RoyaltySet(royalty)
+    emit SplitSet(team_share)
+    return true
+  }
+
+  // role: 1 feeder, 2 verifier, 3 treasury, 4 team, 5 minter
+  fn set_role(role: u128, addr: address): bool {
+    only_admin()
+    assert_address(addr)
+    require(role >= 1, "ons: unknown role")
+    require(role <= 5, "ons: unknown role")
+    if role == 1 { self.feeder = addr }
+    if role == 2 { self.verifier = addr }
+    if role == 3 { self.treasury = addr }
+    if role == 4 { self.team = addr }
+    if role == 5 { self.minter = addr }
+    return true
+  }
+
+  // paused stops register and renew; allowlist_on limits register to listed wallets
+  fn set_gates(paused: u128, allowlist_on: u128): bool {
+    only_admin()
+    require(paused <= 1, "ons: paused must be 0 or 1")
+    require(allowlist_on <= 1, "ons: allowlist must be 0 or 1")
+    self.paused = paused
+    self.allowlist_on = allowlist_on
+    emit AllowlistSet(allowlist_on)
+    return true
+  }
+
+  fn set_allowed(addr: address, on: u128): bool {
+    only_admin()
+    assert_address(addr)
+    require(on <= 1, "ons: on must be 0 or 1")
+    self.allowed[to_string(addr)] = on
+    emit AllowSet(addr, on)
+    return true
+  }
+
+  // lists ("1|addr,addr") or unlists ("0|addr,addr") up to 50 addresses in one call
+  fn allow_batch(spec: string): u128 {
+    only_admin()
+    let flag: string = substr(spec, 0, 2)
+    require(flag == "0|" || flag == "1|", "ons: start with 0| or 1|")
+    let on: u128 = 0
+    if flag == "1|" { on = 1 }
+    let rest: string = substr(spec, 2, len(spec) - 2)
+    let count: u128 = 0
+    for i in 0..50 {
+      if len(rest) > 0 {
+        let cut: int = index_of(rest, ",")
+        let who: string = rest
+        if cut < 0 {
+          rest = ""
+        } else {
+          let at: u128 = cut
+          let total: u128 = len(rest)
+          who = substr(rest, 0, at)
+          rest = substr(rest, at + 1, total - at - 1)
+        }
+        require(len(who) >= 40 && substr(who, 0, 3) == "oct", "ons: not an address")
+        let gap: int = index_of(who, " ")
+        require(gap < 0, "ons: not an address")
+        self.allowed[who] = on
+        count = count + 1
+      }
+    }
+    require(len(rest) == 0, "ons: more than 50 addresses")
+    return count
+  }
+
+  fn set_reserved(name: string, on: u128): bool {
+    only_admin()
+    require(on <= 1, "ons: on must be 0 or 1")
+    require(_check(name, 1) == 0, "ons: bad name")
+    self.reserved[name] = on
+    if on == 0 { self.protected[name] = 0 }
+    emit ReservedSet(name, on)
+    return true
+  }
+
+  // pays out both balances: the treasury share to the treasury, the team share to the team
+  fn withdraw(): u128 {
+    require(caller == self.admin || caller == self.team, "ons: not authorized")
+    let to_treasury: u128 = self.treasury_balance
+    let to_team: u128 = self.team_balance
+    require(to_treasury > 0 || to_team > 0, "ons: nothing to withdraw")
+    self.treasury_balance = 0
+    self.team_balance = 0
+    if to_treasury > 0 {
+      let ok: bool = transfer(self.treasury, to_treasury)
+      require(ok, "ons: transfer failed")
+      emit Withdrawn(self.treasury, to_treasury)
+    }
+    if to_team > 0 {
+      let sent: bool = transfer(self.team, to_team)
+      require(sent, "ons: transfer failed")
+      emit Withdrawn(self.team, to_team)
+    }
+    return _sum(to_treasury, to_team)
+  }
+
+  // how long a year of registration and the grace after expiry last, in seconds
+  fn set_periods(year_secs: u128, grace_secs: u128): bool {
+    only_admin()
+    require(year_secs > 0, "ons: year is zero")
+    require(grace_secs > 0, "ons: grace is zero")
+    self.year_seconds = year_secs
+    self.grace_seconds = grace_secs
+    return true
+  }
+
+  fn set_base_uri(uri: string): bool {
+    only_admin()
+    require(len(uri) <= MAX_URI_LEN, "ons: uri too long")
+    self.base_uri = uri
+    return true
+  }
+
+  fn set_feed_limits(clock_step: u128, secs_per_epoch: u128, rate_bps: u128, stale: u128, min_secs: u128): bool {
+    only_admin()
+    require(clock_step > 0, "ons: step is zero")
+    require(secs_per_epoch > 0, "ons: epoch allowance is zero")
+    require(rate_bps > 0, "ons: rate limit is zero")
+    require(rate_bps < BPS, "ons: rate limit too large")
+    require(stale > 0, "ons: stale limit is zero")
+    require(min_secs <= secs_per_epoch, "ons: epoch floor above its ceiling")
+    self.min_secs_per_epoch = min_secs
+    self.max_clock_step = clock_step
+    self.max_secs_per_epoch = secs_per_epoch
+    self.max_rate_bps = rate_bps
+    self.stale_epochs = stale
+    return true
+  }
+
+  fn transfer_admin(addr: address): bool {
+    only_admin()
+    assert_address(addr)
+    self.pending_admin = addr
+    return true
+  }
+
+  fn accept_admin(): bool {
+    require(caller == self.pending_admin, "ons: not pending admin")
+    let old: address = self.admin
+    self.admin = caller
+    self.pending_admin = self.nobody
+    emit OwnershipTransferred(old, caller)
+    return true
+  }
+}
